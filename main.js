@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, session } = require('electron');
 const { ElectronBlocker } = require('@ghostery/adblocker-electron');
 const fetch = require('cross-fetch');
 const path = require('path');
@@ -12,6 +12,41 @@ let currentSongInfo = null;
 let rpc = null;
 let rpcReady = false;
 const discordClientId = '1529882204325412935';
+
+const CONFIG = {
+  pollIntervalMs: 2000,
+  sessionCacheSize: 512 * 1024 * 1024,
+  jsCallThrottleMs: 500,
+};
+
+let _lastJsCall = 0;
+function throttledExecuteJS(script) {
+  const now = Date.now();
+  const elapsed = now - _lastJsCall;
+  if (elapsed < CONFIG.jsCallThrottleMs) {
+    return Promise.resolve(null);
+  }
+  _lastJsCall = now;
+  if (!mainWindow || mainWindow.isDestroyed()) return Promise.resolve(null);
+  return mainWindow.webContents.executeJavaScript(script).catch(() => null);
+}
+
+let _pendingStatePoll = null;
+function scheduleStatePoll() {
+  if (_pendingStatePoll) return;
+  _pendingStatePoll = setTimeout(() => {
+    _pendingStatePoll = null;
+    updatePlayPauseIcon();
+    fetchSongInfo();
+  }, CONFIG.pollIntervalMs);
+}
+
+function cancelStatePoll() {
+  if (_pendingStatePoll) {
+    clearTimeout(_pendingStatePoll);
+    _pendingStatePoll = null;
+  }
+}
 
 function playerCommand(command) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -95,24 +130,24 @@ function updateThumbarButtons() {
 }
 
 function updatePlayPauseIcon() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.executeJavaScript(`
+  throttledExecuteJS(`
     (function() {
       const video = document.querySelector('video');
       return video ? video.paused : true;
     })()
   `).then((paused) => {
-    currentPlayState = paused ? 'paused' : 'playing';
+    if (paused === null) return;
+    const newState = paused ? 'paused' : 'playing';
+    if (newState === currentPlayState) return;
+    currentPlayState = newState;
     updateThumbarButtons();
     updateTrayMenu();
     updateDiscordPresence();
-  }).catch(() => {});
+  });
 }
 
 function fetchSongInfo() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-
-  mainWindow.webContents.executeJavaScript(`
+  throttledExecuteJS(`
     (function() {
       const video = document.querySelector('video');
       if (!video) return null;
@@ -167,7 +202,7 @@ function fetchSongInfo() {
 
     currentSongInfo = info;
     updateDiscordPresence();
-  }).catch(() => {});
+  });
 }
 
 function updateDiscordPresence() {
@@ -196,6 +231,10 @@ function updateDiscordPresence() {
 }
 
 function createWindow() {
+  const ses = session.fromPartition('persist:musicstation', { cache: CONFIG.sessionCacheSize });
+  ses.setProxy({ proxyRules: 'direct://' }).catch(() => {});
+
+  ses.setCacheSizeLimit(CONFIG.sessionCacheSize).catch(() => {});
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -207,6 +246,8 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      session: ses,
+      backgroundThrottling: false,
     },
   });
 
@@ -218,6 +259,7 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    cancelStatePoll();
     if (tray) {
       tray.destroy();
       tray = null;
@@ -228,7 +270,9 @@ function createWindow() {
     blocker.enableBlockingInSession(mainWindow.webContents.session);
   });
 
-  mainWindow.loadURL('https://music.youtube.com');
+  mainWindow.loadURL('https://music.youtube.com', {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  });
 
   mainWindow.webContents.on('page-title-updated', (event) => {
     event.preventDefault();
@@ -238,30 +282,13 @@ function createWindow() {
   mainWindow.webContents.on('did-finish-load', () => {
     mainWindow.setTitle('Musicstation');
     updateThumbarButtons();
-    startPlayStatePolling();
+    scheduleStatePoll();
   });
 
   mainWindow.on('show', () => {
     mainWindow.setTitle('Musicstation');
     updateThumbarButtons();
   });
-}
-
-let playStateInterval = null;
-
-function startPlayStatePolling() {
-  if (playStateInterval) clearInterval(playStateInterval);
-  playStateInterval = setInterval(() => {
-    updatePlayPauseIcon();
-    fetchSongInfo();
-  }, 1000);
-}
-
-function stopPlayStatePolling() {
-  if (playStateInterval) {
-    clearInterval(playStateInterval);
-    playStateInterval = null;
-  }
 }
 
 function createTray() {
@@ -274,23 +301,38 @@ function createTray() {
     icon = nativeImage.createFromDataURL(iconFallbackDataUrl);
   }
 
-  tray = new Tray(icon);
-  tray.setToolTip('Musicstation');
+  function tryCreateTray(retries = 3) {
+    try {
+      if (tray) {
+        try { tray.destroy(); } catch (_) {}
+        tray = null;
+      }
+      tray = new Tray(icon);
+      tray.setToolTip('Musicstation');
 
-  const contextMenu = Menu.buildFromTemplate([
-    { label: 'Open', click: () => { mainWindow.show(); mainWindow.focus(); } },
-    { type: 'separator' },
-    { label: 'Play/Pause', click: () => playerCommand('playPause') },
-    { label: 'Next',        click: () => playerCommand('next') },
-    { label: 'Previous',    click: () => playerCommand('previous') },
-    { label: 'Shuffle',     click: () => playerCommand('shuffle') },
-    { label: 'Loop',        click: () => playerCommand('loop') },
-    { type: 'separator' },
-    { label: 'Quit', click: () => { isQuitting = true; mainWindow.destroy(); app.quit(); } },
-  ]);
+      const contextMenu = Menu.buildFromTemplate([
+        { label: 'Open', click: () => { mainWindow.show(); mainWindow.focus(); } },
+        { type: 'separator' },
+        { label: 'Play/Pause', click: () => playerCommand('playPause') },
+        { label: 'Next',        click: () => playerCommand('next') },
+        { label: 'Previous',    click: () => playerCommand('previous') },
+        { label: 'Shuffle',     click: () => playerCommand('shuffle') },
+        { label: 'Loop',        click: () => playerCommand('loop') },
+        { type: 'separator' },
+        { label: 'Quit', click: () => { isQuitting = true; mainWindow.destroy(); app.quit(); } },
+      ]);
 
-  tray.setContextMenu(contextMenu);
-  tray.on('click', () => { mainWindow.show(); mainWindow.focus(); });
+      tray.setContextMenu(contextMenu);
+      tray.on('click', () => { mainWindow.show(); mainWindow.focus(); });
+    } catch (err) {
+      console.error('Tray creation failed:', err.message);
+      if (retries > 0) {
+        setTimeout(() => tryCreateTray(retries - 1), 500);
+      }
+    }
+  }
+
+  tryCreateTray(3);
 }
 
 function updateTrayMenu() {
@@ -314,6 +356,19 @@ function registerMediaShortcuts() {
   globalShortcut.register('MediaPlayPause',    () => playerCommand('playPause'));
   globalShortcut.register('MediaNextTrack',    () => playerCommand('next'));
   globalShortcut.register('MediaPreviousTrack', () => playerCommand('previous'));
+}
+
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (_event, argv) => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    }
+  });
 }
 
 app.whenReady().then(() => {
@@ -354,7 +409,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
-  stopPlayStatePolling();
+  cancelStatePoll();
   if (rpc) {
     rpc.destroy();
   }
