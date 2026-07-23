@@ -1,4 +1,9 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, session } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, globalShortcut, session, shell } = require('electron');
+
+if (app.commandLine) {
+  app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
+}
+
 const { ElectronBlocker } = require('@ghostery/adblocker-electron');
 const fetch = require('cross-fetch');
 const path = require('path');
@@ -15,7 +20,6 @@ const discordClientId = '1529882204325412935';
 
 const CONFIG = {
   pollIntervalMs: 2000,
-  sessionCacheSize: 512 * 1024 * 1024,
   jsCallThrottleMs: 500,
 };
 
@@ -230,11 +234,22 @@ function updateDiscordPresence() {
   }
 }
 
-function createWindow() {
-  const ses = session.fromPartition('persist:musicstation', { cache: CONFIG.sessionCacheSize });
-  ses.setProxy({ proxyRules: 'direct://' }).catch(() => {});
+const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
-  ses.setCacheSizeLimit(CONFIG.sessionCacheSize).catch(() => {});
+function createWindow() {
+  const ses = session.fromPartition('persist:musicstation', { cache: true });
+  ses.setProxy({ proxyRules: 'direct://' }).catch(() => {});
+  ses.setUserAgent(CHROME_UA);
+
+  ses.webRequest.onBeforeSendHeaders({ urls: [
+    'https://accounts.google.com/*',
+    'https://*.google.com/*',
+    'https://googleapis.com/*',
+  ]}, (details, callback) => {
+    details.requestHeaders['User-Agent'] = CHROME_UA;
+    callback({ requestHeaders: details.requestHeaders });
+  });
+
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -248,6 +263,7 @@ function createWindow() {
       contextIsolation: true,
       session: ses,
       backgroundThrottling: false,
+      userAgentFallback: CHROME_UA,
     },
   });
 
@@ -270,8 +286,23 @@ function createWindow() {
     blocker.enableBlockingInSession(mainWindow.webContents.session);
   });
 
-  mainWindow.loadURL('https://music.youtube.com', {
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  mainWindow.loadURL('https://music.youtube.com');
+
+  mainWindow.webContents.setWindowOpenHandler((details) => {
+    return {
+      action: 'allow',
+      createWindow: (options) => {
+        const popup = new BrowserWindow({
+          ...options,
+          webPreferences: {
+            ...options.webPreferences,
+            userAgentFallback: CHROME_UA,
+          },
+        });
+        setupPageAntiDetection(popup.webContents);
+        return popup.webContents;
+      },
+    };
   });
 
   mainWindow.webContents.on('page-title-updated', (event) => {
@@ -358,9 +389,102 @@ function registerMediaShortcuts() {
   globalShortcut.register('MediaPreviousTrack', () => playerCommand('previous'));
 }
 
+const antiDetectionScript = `
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch(e){}
+  try { Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+      { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+      { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+      { name: 'Native Client', filename: 'internal-nacl-plugin' }
+    ]
+  }); } catch(e){}
+  try { Object.defineProperty(navigator, 'pdfViewerEnabled', { get: () => true }); } catch(e){}
+  try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch(e){}
+  try { Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' }); } catch(e){}
+  try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch(e){}
+  try { Object.defineProperty(navigator, 'platform', { get: () => 'Win32' }); } catch(e){}
+  try {
+    if (!window.chrome) window.chrome = {};
+    if (!window.chrome.runtime) window.chrome.runtime = {};
+    if (!window.chrome.loadTimes) {
+      window.chrome.loadTimes = function() {
+        return {
+          requestTime: 0, startLoadTime: 0, commitLoadTime: 0,
+          finishDocumentLoadTime: 0, finishLoadTime: 0, firstPaintTime: 0,
+          firstPaintAfterLoadTime: 0, navigationType: 'Other',
+          wasFetchedViaSpdy: false, wasNpnNegotiated: false,
+          npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false,
+          connectionInfo: 'http/2'
+        };
+      };
+    }
+    if (!window.chrome.csi) window.chrome.csi = function() { return {}; };
+  } catch(e){}
+  try {
+    if (navigator.userAgentData) {
+      const orig = navigator.userAgentData;
+      Object.defineProperty(navigator, 'userAgentData', {
+        get: () => ({
+          brands: [
+            { brand: 'Google Chrome', version: '130' },
+            { brand: 'Chromium', version: '130' },
+            { brand: 'Not?A_Brand', version: '99' }
+          ],
+          mobile: false,
+          platform: 'Windows',
+          getHighEntropyValues: orig.getHighEntropyValues ? orig.getHighEntropyValues.bind(orig) : undefined
+        }),
+        configurable: true
+      });
+    }
+  } catch(e){}
+  try {
+    if (performance && !performance.memory) {
+      Object.defineProperty(performance, 'memory', {
+        get: () => ({
+          jsHeapSizeLimit: 4294705152,
+          totalJSHeapSize: 10000000,
+          usedJSHeapSize: 8000000
+        })
+      });
+    }
+  } catch(e){}
+  try {
+    if (!navigator.connection) {
+      Object.defineProperty(navigator, 'connection', {
+        get: () => ({
+          downlink: 10, effectiveType: '4g',
+          onchange: null, rtt: 50, saveData: false
+        })
+      });
+    }
+  } catch(e){}
+  try {
+    if (navigator.deviceMemory === undefined) {
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    }
+  } catch(e){}
+`;
+
+async function setupPageAntiDetection(wc) {
+  wc.userAgent = CHROME_UA;
+  try {
+    await wc.debugger.attach('1.3');
+    await wc.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
+      source: antiDetectionScript
+    });
+  } catch (e) {
+    console.error('Anti-detection setup failed:', e.message);
+  }
+}
+
+app.on('web-contents-created', (_event, wc) => {
+  setupPageAntiDetection(wc);
+});
+
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
-  app.quit();
+  app.exit(0);
 } else {
   app.on('second-instance', (_event, argv) => {
     if (mainWindow) {
